@@ -749,10 +749,8 @@ type refindices struct {
 	// memberships holds the collection memberships of each rule; see membership.
 	memberships map[*Rule][]membership
 	// stats holds what Sorted ranks the references by, indexed by ref id.
-	stats []refStats
-	// counted holds each rule and ref that countFor has counted.
-	counted map[countedRef]struct{}
-	sorted  []refID
+	stats  []refStats
+	sorted []refID
 }
 
 // refStats is what one reference accumulated over a build, which is what decides
@@ -783,7 +781,6 @@ func newrefindices(isVirtual func(Ref) bool, table *refTable) *refindices {
 		table:       table,
 		rules:       map[*Rule][]*refindex{},
 		memberships: map[*Rule][]membership{},
-		counted:     map[countedRef]struct{}{},
 	}
 }
 
@@ -1408,8 +1405,8 @@ func (i *refindices) recordMembership(rule *Rule, key, collection Ref) {
 			return
 		}
 	}
-	i.memberships[rule] = append(i.memberships[rule], membership{key: key, collection: collection})
 	i.countFor(rule, i.table.intern(key))
+	i.memberships[rule] = append(i.memberships[rule], membership{key: key, collection: collection})
 }
 
 func (i *refindices) resolveAndValidateRef(rule *Rule, args []*Term, term *Term) Ref {
@@ -1504,19 +1501,22 @@ func (i *refindices) count(ref refID) {
 	i.stat(ref).count++
 }
 
-// countedRef is a rule and a ref it is indexed on.
-type countedRef struct {
-	rule *Rule
-	ref  refID
-}
-
-// countFor counts ref for rule the first time rule records it, and not again.
+// countFor counts ref for rule unless rule already holds an index or a
+// membership on it, each of which was counted when it was recorded.
 func (i *refindices) countFor(rule *Rule, ref refID) {
-	key := countedRef{rule: rule, ref: ref}
-	if _, ok := i.counted[key]; ok {
-		return
+	for _, other := range i.rules[rule] {
+		if other.ref == ref {
+			return
+		}
 	}
-	i.counted[key] = struct{}{}
+	if ms := i.memberships[rule]; len(ms) > 0 {
+		key := i.table.ref(ref)
+		for _, m := range ms {
+			if RefEqual(m.key, key) {
+				return
+			}
+		}
+	}
 	i.count(ref)
 }
 

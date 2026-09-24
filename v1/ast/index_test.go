@@ -1847,16 +1847,19 @@ func (r *refRecorder) Resolve(ref Ref) (Value, error) {
 func TestRefIndicesCountOncePerRule(t *testing.T) {
 	tests := []struct {
 		note string
+		head string
 		body []string
 		ref  string
 		exp  int32
 	}{
-		{"membership in a collection at a ref", []string{`"a" in input.roles`}, "input.roles", 1},
-		{"a ref in a literal collection", []string{`input.x in {"a", "b", "c"}`}, "input.x", 1},
-		{"a ref with several prefixes", []string{`strings.any_prefix_match(input.path, ["/a", "/b", "/c"])`}, "input.path", 1},
-		{"a ref compared with two values", []string{`input.x == "a"`, `input.x == "b"`}, "input.x", 1},
-		{"a ref keying two collections in data", []string{`data.a.m[input.k]`, `data.b.m[input.k]`}, "input.k", 1},
-		{"one rule for each of two bodies", []string{`"a" in input.roles`, `"b" in input.roles`}, "input.roles", 2},
+		{"membership in a collection at a ref", "p", []string{`"a" in input.roles`}, "input.roles", 1},
+		{"a ref in a literal collection", "p", []string{`input.x in {"a", "b", "c"}`}, "input.x", 1},
+		{"a ref with several prefixes", "p", []string{`strings.any_prefix_match(input.path, ["/a", "/b", "/c"])`}, "input.path", 1},
+		{"a ref compared with two values", "p", []string{`input.x == "a"`, `input.x == "b"`}, "input.x", 1},
+		{"a ref keying two collections in data", "p", []string{`data.a.m[input.k]`, `data.b.m[input.k]`}, "input.k", 1},
+		{"an argument keying two collections in data", "f(x)", []string{`data.a.m[x]`, `data.b.m[x]`}, "args[0]", 1},
+		{"an argument keying a collection and compared with a value", "f(x)", []string{`data.a.m[x]`, `x == "a"`}, "args[0]", 1},
+		{"one rule for each of two bodies", "p", []string{`"a" in input.roles`, `"b" in input.roles`}, "input.roles", 2},
 	}
 
 	for _, tc := range tests {
@@ -1865,10 +1868,10 @@ func TestRefIndicesCountOncePerRule(t *testing.T) {
 			var sb strings.Builder
 			sb.WriteString("package test\n\n")
 			if tc.exp == 1 {
-				fmt.Fprintf(&sb, "p if {\n\t%s\n}\n", strings.Join(tc.body, "\n\t"))
+				fmt.Fprintf(&sb, "%s if {\n\t%s\n}\n", tc.head, strings.Join(tc.body, "\n\t"))
 			} else {
 				for _, expr := range tc.body {
-					fmt.Fprintf(&sb, "p if {\n\t%s\n}\n", expr)
+					fmt.Fprintf(&sb, "%s if {\n\t%s\n}\n", tc.head, expr)
 				}
 			}
 
@@ -1879,7 +1882,7 @@ func TestRefIndicesCountOncePerRule(t *testing.T) {
 			}
 
 			var act int32
-			buildIndexWithOrder(c.GetRulesExact(MustParseRef("data.test.p")), func(i *refindices) []refID {
+			buildIndexWithOrder(c.GetRules(MustParseRef("data.test")), func(i *refindices) []refID {
 				for id, stats := range i.stats {
 					if i.table.ref(refID(id)).String() == tc.ref {
 						act = stats.count
