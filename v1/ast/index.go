@@ -749,16 +749,21 @@ type refindices struct {
 	// memberships holds the collection memberships of each rule; see membership.
 	memberships map[*Rule][]membership
 	// stats holds what Sorted ranks the references by, indexed by ref id.
-	stats  []refStats
-	sorted []refID
+	stats []refStats
+	// counted holds each rule and ref that countFor has counted.
+	counted map[countedRef]struct{}
+	sorted  []refID
 }
 
 // refStats is what one reference accumulated over a build, which is what decides
 // the order of the trie's levels. Dropped once the trie is built.
 type refStats struct {
-	// count is how often the ref took part in indexing a rule. Sorted passes
-	// over the ids that never counted: a scratch interns the refs of an operand
-	// that may turn out unindexable, and then nothing records them.
+	// count is how many rules the ref takes part in indexing, however many of
+	// a rule's expressions read it: `"a" in input.roles` compiles to an
+	// assignment of input.roles and a call, and counts once. Each alternative
+	// of a disjunction counts on its own. Sorted passes over the ids that never
+	// counted: a scratch interns the refs of an operand that may turn out
+	// unindexable, and then nothing records them.
 	count int32
 	// alternated is whether some rule reaches the ref by more than one value,
 	// and what that costs insertPath. An `or` is not recorded: its alternatives
@@ -778,6 +783,7 @@ func newrefindices(isVirtual func(Ref) bool, table *refTable) *refindices {
 		table:       table,
 		rules:       map[*Rule][]*refindex{},
 		memberships: map[*Rule][]membership{},
+		counted:     map[countedRef]struct{}{},
 	}
 }
 
@@ -1353,8 +1359,6 @@ func (i *refindices) insertMembers(rule *Rule, ref Ref, members []Value) {
 	}
 	i.rules[rule] = indices[:pos]
 
-	i.countN(id, len(rest))
-
 	if concrete > 1 {
 		i.alternate(id, alternationConverging)
 	}
@@ -1405,7 +1409,7 @@ func (i *refindices) recordMembership(rule *Rule, key, collection Ref) {
 		}
 	}
 	i.memberships[rule] = append(i.memberships[rule], membership{key: key, collection: collection})
-	i.count(i.table.intern(key))
+	i.countFor(rule, i.table.intern(key))
 }
 
 func (i *refindices) resolveAndValidateRef(rule *Rule, args []*Term, term *Term) Ref {
@@ -1494,13 +1498,26 @@ func (i *refindices) resolvable(rule *Rule) []*refindex {
 }
 
 // count records that ref took part in indexing a rule, which is what orders the
-// trie levels (see Sorted).
+// trie levels (see Sorted). Every caller but a disjunction's goes through
+// countFor.
 func (i *refindices) count(ref refID) {
-	i.countN(ref, 1)
+	i.stat(ref).count++
 }
 
-func (i *refindices) countN(ref refID, n int) {
-	i.stat(ref).count += int32(n)
+// countedRef is a rule and a ref it is indexed on.
+type countedRef struct {
+	rule *Rule
+	ref  refID
+}
+
+// countFor counts ref for rule the first time rule records it, and not again.
+func (i *refindices) countFor(rule *Rule, ref refID) {
+	key := countedRef{rule: rule, ref: ref}
+	if _, ok := i.counted[key]; ok {
+		return
+	}
+	i.counted[key] = struct{}{}
+	i.count(ref)
 }
 
 // stat returns the reference's statistics, making room for them if this is the
@@ -1542,7 +1559,7 @@ func (i *refindices) alternate(ref refID, kind alternation) {
 }
 
 func (i *refindices) insert(rule *Rule, index *refindex) {
-	i.count(index.ref)
+	i.countFor(rule, index.ref)
 
 	indexValueIsVar := index.isVar()
 

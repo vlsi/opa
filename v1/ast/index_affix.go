@@ -486,7 +486,7 @@ func (i *refindices) updateAnyAffixMatch(rule *Rule, expr *Expr, constants map[V
 // key types.
 func (i *refindices) insertAffixes(rule *Rule, ref Ref, bases []Value, a affix) {
 	id := i.table.intern(ref)
-	i.countN(id, len(bases))
+	i.countFor(rule, id)
 
 	// concrete counts the values this rule already reaches ref by that survive
 	// insertPath's var-stripping, so that the alternatives the base adds can be

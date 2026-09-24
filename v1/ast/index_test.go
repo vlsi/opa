@@ -6,9 +6,11 @@ package ast
 
 import (
 	"errors"
+	"fmt"
 	"math/bits"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -1822,6 +1824,134 @@ func TestRefIndicesSorted(t *testing.T) {
 			t.Fatalf("expected refs sorted by descending frequency, but got %v with count %d after count %d", sorted, count, prevCount)
 		}
 		prevCount = count
+	}
+}
+
+// refRecorder is a testResolver that keeps the refs a lookup resolved.
+type refRecorder struct {
+	testResolver
+	resolved []string
+}
+
+func (r *refRecorder) Resolve(ref Ref) (Value, error) {
+	r.resolved = append(r.resolved, ref.String())
+	return r.testResolver.Resolve(ref)
+}
+
+// A ref counts once for each rule indexed on it, however many of the rule's
+// expressions read it and however many values they compare it with. The
+// compiler turns `"a" in input.roles` into an assignment of input.roles and a
+// call, and `data.a.m[input.k]` into an assignment of input.k and a lookup;
+// each of those expressions, and each value of a literal collection, used to
+// count on its own.
+func TestRefIndicesCountOncePerRule(t *testing.T) {
+	tests := []struct {
+		note string
+		body []string
+		ref  string
+		exp  int32
+	}{
+		{"membership in a collection at a ref", []string{`"a" in input.roles`}, "input.roles", 1},
+		{"a ref in a literal collection", []string{`input.x in {"a", "b", "c"}`}, "input.x", 1},
+		{"a ref with several prefixes", []string{`strings.any_prefix_match(input.path, ["/a", "/b", "/c"])`}, "input.path", 1},
+		{"a ref compared with two values", []string{`input.x == "a"`, `input.x == "b"`}, "input.x", 1},
+		{"a ref keying two collections in data", []string{`data.a.m[input.k]`, `data.b.m[input.k]`}, "input.k", 1},
+		{"one rule for each of two bodies", []string{`"a" in input.roles`, `"b" in input.roles`}, "input.roles", 2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			// The last case puts each expression in a rule of its own.
+			var sb strings.Builder
+			sb.WriteString("package test\n\n")
+			if tc.exp == 1 {
+				fmt.Fprintf(&sb, "p if {\n\t%s\n}\n", strings.Join(tc.body, "\n\t"))
+			} else {
+				for _, expr := range tc.body {
+					fmt.Fprintf(&sb, "p if {\n\t%s\n}\n", expr)
+				}
+			}
+
+			c := NewCompiler()
+			c.Compile(map[string]*Module{"test.rego": MustParseModule(sb.String())})
+			if c.Failed() {
+				t.Fatal(c.Errors)
+			}
+
+			var act int32
+			buildIndexWithOrder(c.GetRulesExact(MustParseRef("data.test.p")), func(i *refindices) []refID {
+				for id, stats := range i.stats {
+					if i.table.ref(refID(id)).String() == tc.ref {
+						act = stats.count
+					}
+				}
+				return i.Sorted()
+			})
+			if act != tc.exp {
+				t.Errorf("%s: expected %s to count %d, got %d", sb.String(), tc.ref, tc.exp, act)
+			}
+		})
+	}
+}
+
+// Refs that as many rules use as each other are ordered by where they first
+// appear, so the rules decide which of input.id and input.perms a lookup tests
+// first. A lookup that tests input.id first and finds no rule for it never
+// reads input.perms. Before a ref counted once per rule, input.perms counted
+// twice and came first either way.
+func TestBaseDocEqIndexRefOrderFollowsSource(t *testing.T) {
+	module := func(membershipFirst bool) string {
+		var sb strings.Builder
+		sb.WriteString("package test\n\n")
+		for k := range 3 {
+			in := fmt.Sprintf("\"p%d\" in input.perms", k)
+			eq := fmt.Sprintf("input.id == \"r%d\"", k)
+			if membershipFirst {
+				in, eq = eq, in
+			}
+			fmt.Fprintf(&sb, "allow if {\n\t%s\n\t%s\n}\n\n", eq, in)
+		}
+		return sb.String()
+	}
+
+	tests := []struct {
+		note            string
+		membershipFirst bool
+		id              string
+		expRules        int
+		expFirst        string
+		expReadsPerms   bool
+	}{
+		{"equality first, an id no rule names", false, "r9", 0, "input.id", false},
+		{"equality first, an id one rule names", false, "r1", 1, "input.id", true},
+		{"membership first, an id no rule names", true, "r9", 0, "input.perms", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler()
+			c.Compile(map[string]*Module{"test.rego": MustParseModule(module(tc.membershipFirst))})
+			if c.Failed() {
+				t.Fatal(c.Errors)
+			}
+			index := c.RuleIndex(MustParseRef("data.test.allow"))
+
+			input := MustParseTerm(`{"id": "` + tc.id + `", "perms": ["p0", "p1", "p2"]}`)
+			r := &refRecorder{testResolver: testResolver{input: input}}
+			res, err := index.Lookup(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res.Rules) != tc.expRules {
+				t.Errorf("expected %d candidates, got %v", tc.expRules, res.Rules)
+			}
+			if len(r.resolved) == 0 || r.resolved[0] != tc.expFirst {
+				t.Errorf("expected the lookup to resolve %s first, got %v", tc.expFirst, r.resolved)
+			}
+			if act := slices.Contains(r.resolved, "input.perms"); act != tc.expReadsPerms {
+				t.Errorf("expected reading input.perms to be %v, got %v (resolved %v)", tc.expReadsPerms, act, r.resolved)
+			}
+		})
 	}
 }
 
