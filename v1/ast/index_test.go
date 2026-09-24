@@ -6,9 +6,12 @@ package ast
 
 import (
 	"errors"
+	"fmt"
 	"math/bits"
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -1822,6 +1825,199 @@ func TestRefIndicesSorted(t *testing.T) {
 			t.Fatalf("expected refs sorted by descending frequency, but got %v with count %d after count %d", sorted, count, prevCount)
 		}
 		prevCount = count
+	}
+}
+
+// A lookup reaches the rules whose value is an element of the collection at the
+// ref, whichever side it walks: the collection's elements, passed through the
+// level's hash filter, or, for a set of more than membershipWalkMax elements,
+// the level's children when there are fewer of them. The filter grows as
+// children are added, so a level of 30 children still finds "v2", added before
+// the filter last grew. Elements compare by value, so 1.0 reaches the rule for
+// 1, and 1.5, whose hash equals that of 1, does not.
+func TestBaseDocEqIndexMembershipInCollection(t *testing.T) {
+	// ruleset returns n rules requiring "v0" to "v<n-1>" in input.xs, and one
+	// requiring 1.
+	ruleset := func(n int) RuleSet {
+		var sb strings.Builder
+		sb.WriteString("package test\n\n")
+		for k := range n {
+			fmt.Fprintf(&sb, "allow if { \"v%d\" in input.xs }\n", k)
+		}
+		sb.WriteString("allow if { 1 in input.xs }\n")
+
+		c := NewCompiler()
+		c.Compile(map[string]*Module{"test.rego": MustParseModule(sb.String())})
+		if c.Failed() {
+			t.Fatal(c.Errors)
+		}
+		return c.GetRulesExact(MustParseRef("data.test.allow"))
+	}
+
+	// member returns the value a rule requires in input.xs.
+	member := func(rule *Rule) string {
+		for _, expr := range rule.Body {
+			if expr.Operator().Equal(Member.Ref()) {
+				return expr.Operand(0).String()
+			}
+		}
+		t.Fatalf("no membership test in %v", rule)
+		return ""
+	}
+
+	// Past membershipWalkMax elements, filler strings no rule requires make the
+	// collection large without changing which rules it reaches.
+	const large = membershipWalkMax + 4
+
+	tests := []struct {
+		note   string
+		rules  int
+		kind   string
+		elems  []string
+		filler int
+		exp    []string
+	}{
+		{"small array, an element present", 3, "array", []string{`"v1"`, `"q"`}, 0, []string{`"v1"`}},
+		{"small array, 1.0 for 1", 3, "array", []string{`1.0`}, 0, []string{"1"}},
+		{"small array, 1.5 for 1", 3, "array", []string{`1.5`}, 0, nil},
+		{"large array, few children, an element present", 3, "array", []string{`"v1"`}, large, []string{`"v1"`}},
+		{"large array, few children, no element present", 3, "array", nil, large, nil},
+		{"large array, few children, 1.0 for 1", 3, "array", []string{`1.0`}, large, []string{"1"}},
+		{"large array, few children, 1.5 for 1", 3, "array", []string{`1.5`}, large, nil},
+		{"large array, few children, duplicates and an object", 3, "array", []string{`"v2"`, `"v2"`, `{"v1": true}`}, large, []string{`"v2"`}},
+		{"large array, many children, an element present", 30, "array", []string{`"v2"`}, large, []string{`"v2"`}},
+		{"large array, many children, no element present", 30, "array", nil, large, nil},
+		{"large array, many children, 1.0 for 1", 30, "array", []string{`1.0`}, large, []string{"1"}},
+		{"large array, many children, 1.5 for 1", 30, "array", []string{`1.5`}, large, nil},
+		{"small set, an element present", 3, "set", []string{`"v1"`, `"q"`}, 0, []string{`"v1"`}},
+		{"large set, fewer children, an element present", 3, "set", []string{`"v1"`}, large, []string{`"v1"`}},
+		{"large set, fewer children, no element present", 3, "set", nil, large, nil},
+		{"large set, fewer children, 1.0 for 1", 3, "set", []string{`1.0`}, large, []string{"1"}},
+		{"large set, fewer children, 1.5 for 1", 3, "set", []string{`1.5`}, large, nil},
+		{"large set, more children, an element present", 30, "set", []string{`"v2"`}, large, []string{`"v2"`}},
+		{"large set, more children, no element present", 30, "set", nil, large, nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			index := newBaseDocEqIndex(func(Ref) bool { return false })
+			if !index.Build(ruleset(tc.rules)) {
+				t.Fatal("expected index build to succeed")
+			}
+
+			elems := slices.Clone(tc.elems)
+			for k := range tc.filler {
+				elems = append(elems, fmt.Sprintf(`"f%d"`, k))
+			}
+			xs := "[" + strings.Join(elems, ", ") + "]"
+			if tc.kind == "set" {
+				xs = "{" + strings.Join(elems, ", ") + "}"
+			}
+
+			res, err := index.Lookup(testResolver{input: MustParseTerm(`{"xs": ` + xs + `}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var act []string
+			for _, rule := range res.Rules {
+				act = append(act, member(rule))
+			}
+			slices.Sort(act)
+			if !slices.Equal(act, tc.exp) {
+				t.Errorf("input.xs = %s %v and %d filler strings: expected candidates requiring %v, got %v",
+					tc.kind, tc.elems, tc.filler, tc.exp, act)
+			}
+		})
+	}
+}
+
+// A level that some rule reaches by several values keeps those values apart
+// from its scalar children, so a lookup that walks a collection at it tests
+// every element against them, whatever the hash filter or the set would say.
+// Here `input.xs in {"a", "b"}` puts "a" and "b" on the input.xs level as
+// alternatives, and the element "b" reaches that rule.
+func TestBaseDocEqIndexMembershipAtLevelWithAlternatives(t *testing.T) {
+	c := NewCompiler()
+	c.Compile(map[string]*Module{"test.rego": MustParseModule(`package test
+
+allow if {
+	input.xs in {"a", "b"}
+	input.y in {1, 2}
+}
+
+allow if { "c" in input.xs }
+
+allow if { "d" in input.xs }`)})
+	if c.Failed() {
+		t.Fatal(c.Errors)
+	}
+	index := c.RuleIndex(MustParseRef("data.test.allow"))
+
+	// More than membershipWalkMax elements, so that a set is large enough to
+	// be matched from the children's side.
+	elems := []string{`"b"`}
+	for k := range membershipWalkMax + 4 {
+		elems = append(elems, fmt.Sprintf(`"f%d"`, k))
+	}
+
+	for _, tc := range []struct{ kind, xs string }{
+		{"array", "[" + strings.Join(elems, ", ") + "]"},
+		{"set", "{" + strings.Join(elems, ", ") + "}"},
+	} {
+		xs := tc.xs
+		t.Run(tc.kind, func(t *testing.T) {
+			res, err := index.Lookup(testResolver{input: MustParseTerm(`{"y": 1, "xs": ` + xs + `}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res.Rules) != 1 || !strings.Contains(res.Rules[0].Body.String(), "input.y") {
+				t.Errorf("input.xs = %s: expected the rule requiring input.xs in {\"a\", \"b\"}, got %v", xs, res.Rules)
+			}
+		})
+	}
+}
+
+// A lookup may walk a set that another query iterates at the same time, as a
+// set from base data is shared between queries. The first Iter sorts the set's
+// keys in place, so a walk has to read them through the same guard. The race
+// detector reports the walk otherwise; without it this test checks nothing.
+func TestBaseDocEqIndexMembershipSharedSet(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("package test\n\n")
+	for k := range 60 {
+		fmt.Fprintf(&sb, "allow if { \"v%d\" in input.xs }\n", k)
+	}
+	c := NewCompiler()
+	c.Compile(map[string]*Module{"test.rego": MustParseModule(sb.String())})
+	if c.Failed() {
+		t.Fatal(c.Errors)
+	}
+	index := c.RuleIndex(MustParseRef("data.test.allow"))
+
+	for range 20 {
+		// 40 unsorted elements: more than membershipWalkMax, and fewer than
+		// the level's 60 children, so the lookup walks the set.
+		elems := make([]*Term, 40)
+		for k := range elems {
+			elems[k] = StringTerm(fmt.Sprintf("z%d", len(elems)-k))
+		}
+		set := NewSet(elems...)
+		input := ObjectTerm([2]*Term{StringTerm("xs"), NewTerm(set)})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = set.Iter(func(*Term) error { return nil })
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := index.Lookup(testResolver{input: input}); err != nil {
+				t.Error(err)
+			}
+		}()
+		wg.Wait()
 	}
 }
 

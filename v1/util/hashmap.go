@@ -208,8 +208,15 @@ func NewHasherMap[K Hasher, V any](keq func(K, K) bool) *HasherMap[K, V] {
 
 // Get returns the value for k.
 func (h *HasherMap[K, V]) Get(k K) (V, bool) {
+	return h.GetWithHash(k.Hash(), k)
+}
+
+// GetWithHash returns the value for k, whose hash the caller already holds.
+// The caller has to pass k.Hash() as hash: under any other hash, k is reported
+// absent.
+func (h *HasherMap[K, V]) GetWithHash(hash int, k K) (V, bool) {
 	if h != nil {
-		for entry := h.table[k.Hash()]; entry != nil; entry = entry.next {
+		for entry := h.table[hash]; entry != nil; entry = entry.next {
 			if h.keq(entry.k, k) {
 				return entry.v, true
 			}

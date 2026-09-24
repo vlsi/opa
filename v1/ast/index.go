@@ -1776,6 +1776,53 @@ type levelDetail struct {
 	prefixes     *prefixTrie
 	suffixes     *prefixTrie
 	alternatives *alternativeChildren
+	// filter holds the hashes of the scalar children, so that a lookup can
+	// pass over a collection element no child equals without searching the
+	// children for it.
+	filter hashFilter
+}
+
+// hashFilter is a Bloom filter with one hash function over the hashes of a
+// set of values: it may report a hash the set does not hold, and never misses
+// one it does. It keeps at least hashFilterBits bits per value, so at most
+// about one hash in that many is reported by mistake.
+type hashFilter []uint64
+
+const hashFilterBits = 16
+
+// with returns the filter holding hash as well. n is the number of values the
+// filter is to hold, hash's among them. Where that leaves fewer than
+// hashFilterBits bits per value, with returns a new filter of twice the bits
+// the values need, holding hash and the hash of every value in children.
+func (f hashFilter) with(hash, n int, children *util.HasherMap[Value, *trieNode]) hashFilter {
+	if len(f)*64 < n*hashFilterBits {
+		words := 1
+		for words*64 < 2*n*hashFilterBits {
+			words *= 2
+		}
+		f = make(hashFilter, words)
+		children.Iter(func(v Value, _ *trieNode) bool {
+			f.add(v.Hash())
+			return false
+		})
+	}
+	f.add(hash)
+	return f
+}
+
+func (f hashFilter) add(hash int) {
+	bit := uint(hash) & uint(len(f)*64-1)
+	f[bit>>6] |= 1 << (bit & 63)
+}
+
+// mayContain reports whether hash may be among the hashes f holds. An empty
+// filter holds nothing.
+func (f hashFilter) mayContain(hash int) bool {
+	if len(f) == 0 {
+		return false
+	}
+	bit := uint(hash) & uint(len(f)*64-1)
+	return f[bit>>6]&(1<<(bit&63)) != 0
 }
 
 // alternativeChildren are the nodes that rules reaching a level by several
@@ -1990,6 +2037,7 @@ func (d *levelDetail) insertValue(value Value) *trieNode {
 			child = newTrieNodeImpl()
 			detail.scalars = util.Or(detail.scalars, newScalarChildren)
 			detail.scalars.Put(value, child)
+			detail.filter = detail.filter.with(value.Hash(), detail.scalars.Len(), detail.scalars)
 		}
 		return child
 	case *Array:
@@ -2235,40 +2283,106 @@ func (alt *alternativeChildren) traverse(resolver ValueResolver, tr *trieTravers
 	return nil
 }
 
+// membershipWalkMax is the size up to which a lookup walks a set whatever the
+// level holds. Past it, a set with more elements than the level has children
+// is matched from the children's side, each child looked up in the set.
+const membershipWalkMax = 16
+
 func (d *levelDetail) traverseCollectionMembership(resolver ValueResolver, tr *trieTraversalResult, collection Value) error {
-	alt := d.alternatives
-	checkMember := func(t *Term) error {
-		if IsScalar(t.Value) {
-			child, _ := d.scalars.Get(t.Value)
-			if err := child.Traverse(resolver, tr); err != nil {
-				return err
-			}
-			if alt != nil {
-				return alt.traverse(resolver, tr, t.Value)
-			}
-		}
-		return nil
+	// A level with alternatives has children the scalars and the filter do not
+	// list, so it walks the collection's elements and tests each one against
+	// the alternatives too.
+	if col, ok := collection.(Set); ok && d.alternatives == nil &&
+		col.Len() > membershipWalkMax && d.scalars.Len() < col.Len() {
+		return d.traverseChildrenInSet(resolver, tr, col)
 	}
 
 	switch col := collection.(type) {
 	case *Array:
-		return col.Iter(checkMember)
+		for i, t := range col.elems {
+			if d.mayReach(col.hashs[i]) {
+				if err := d.traverseMember(resolver, tr, t.Value, col.hashs[i]); err != nil {
+					return err
+				}
+			}
+		}
 	case Set:
-		return col.Iter(checkMember)
+		// Ranging over the elements does not allocate; a closure passed to
+		// Iter escapes. sortedKeys, like Iter, sorts the keys once and safely
+		// for sets that concurrent queries share.
+		if st, ok := col.(*set); ok {
+			for _, t := range st.sortedKeys() {
+				if err := d.traverseMemberHashing(resolver, tr, t.Value); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return col.Iter(func(t *Term) error {
+			return d.traverseMemberHashing(resolver, tr, t.Value)
+		})
 	case Object:
 		// Function literal does not escape
 		if o, ok := col.(*object); ok {
 			return o.Iter(func(_, v *Term) error {
-				return checkMember(v)
+				return d.traverseMemberHashing(resolver, tr, v.Value)
 			})
 		}
 		// Function literal escapes
 		return col.Iter(func(_, v *Term) error {
-			return checkMember(v)
+			return d.traverseMemberHashing(resolver, tr, v.Value)
 		})
 	}
 
 	return nil
+}
+
+// mayReach reports whether a collection element with this hash may reach a
+// child of the level. Only the hash filter can rule one out, and it does not
+// list the values of the level's alternatives.
+func (d *levelDetail) mayReach(hash int) bool {
+	return d.alternatives != nil || d.filter.mayContain(hash)
+}
+
+// traverseMemberHashing is traverseMember for an element whose hash the
+// collection does not hold.
+func (d *levelDetail) traverseMemberHashing(resolver ValueResolver, tr *trieTraversalResult, v Value) error {
+	if hash := v.Hash(); d.mayReach(hash) {
+		return d.traverseMember(resolver, tr, v, hash)
+	}
+	return nil
+}
+
+// traverseMember visits the children that the collection element v, whose hash
+// is hash, reaches: the scalar child equal to it, and the children of the
+// alternatives that hold it.
+func (d *levelDetail) traverseMember(resolver ValueResolver, tr *trieTraversalResult, v Value, hash int) error {
+	if !IsScalar(v) {
+		return nil
+	}
+	child, _ := d.scalars.GetWithHash(hash, v)
+	if err := child.Traverse(resolver, tr); err != nil {
+		return err
+	}
+	if d.alternatives != nil {
+		return d.alternatives.traverse(resolver, tr, v)
+	}
+	return nil
+}
+
+// traverseChildrenInSet visits the children whose value is an element of set,
+// looking each child up in the set.
+func (d *levelDetail) traverseChildrenInSet(resolver ValueResolver, tr *trieTraversalResult, set Set) error {
+	var err error
+	probe := &Term{}
+	d.scalars.Iter(func(v Value, child *trieNode) bool {
+		probe.Value = v
+		if set.Contains(probe) {
+			err = child.Traverse(resolver, tr)
+		}
+		return err != nil
+	})
+	return err
 }
 
 // traverseUnknown visits every child of a level whose reference the resolver
